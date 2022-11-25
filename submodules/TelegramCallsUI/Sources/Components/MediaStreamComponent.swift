@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import ComponentFlow
 import Display
+import AsyncDisplayKit
 import AccountContext
 import SwiftSignalKit
 import AVKit
@@ -18,6 +19,425 @@ import BundleIconComponent
 import CreateExternalMediaStreamScreen
 import HierarchyTrackingLayer
 import UndoPanelComponent
+
+// MARK: - New StreamController
+
+public final class MediaStreamController: ViewController, VoiceChatController {
+    
+    fileprivate final class Node: ViewControllerTracingNode, UIGestureRecognizerDelegate {
+        
+        private struct ListTransition {
+            let deletions: [ListViewDeleteItem]
+            let insertions: [ListViewInsertItem]
+            let updates: [ListViewUpdateItem]
+            let isLoading: Bool
+            let isEmpty: Bool
+            let canInvite: Bool
+            let crossFade: Bool
+            let count: Int
+            let animated: Bool
+        }
+        
+        private var enqueuedTransitions: [ListTransition] = []
+        weak var controller: MediaStreamController?
+        private let sharedContext: SharedAccountContext
+        private let context: AccountContext
+        let backgroundNode: ASDisplayNode
+        let dimNode: ASDisplayNode
+        let contentContainer: ASDisplayNode
+        let optionsButton: VoiceChatHeaderButton
+        let pictureInPictureButton: VoiceChatHeaderButton
+        let membersNumberLabel: ASTextNode
+        let watchingLabel: ASTextNode
+        let shareButton: CallControllerButtonItemNode
+        let leaveButton: CallControllerButtonItemNode
+        let expandButton: CallControllerButtonItemNode
+        let streamPreview: ASImageNode
+        
+        private var videoRenderingContext: VideoRenderingContext
+        var streamVideoNode: GroupVideoNode?
+        
+        var panGestureRecognizer: UIPanGestureRecognizer?
+        
+        var visibility = false
+        var animatingAppearance = false
+        private var validLayout: (ContainerViewLayout, CGFloat)?
+        private var initialContentViewYOrigin: CGFloat = 0.0
+        
+        init(controller: MediaStreamController, sharedContext: SharedAccountContext, call: PresentationGroupCall) {
+            self.controller = controller
+            self.sharedContext = sharedContext
+            self.context = call.accountContext
+            self.backgroundNode = .init()
+            self.dimNode = .init()
+            self.contentContainer = .init()
+            self.optionsButton = .init(context: self.context)
+            self.pictureInPictureButton = .init(context: self.context)
+            self.membersNumberLabel = .init()
+            self.watchingLabel = .init()
+            self.shareButton = .init()
+            let bottomButtonsSize = CGSize(width: 80, height: 80)
+            self.shareButton.update(size: bottomButtonsSize,
+                                   content: .init(appearance: .color(.green), image: .share),
+                                   text: "share",
+                                   transition: .immediate)
+            self.expandButton = .init()
+            self.expandButton.update(size: bottomButtonsSize,
+                                     content: .init(appearance: .color(.green), image: .flipCamera),
+                                   text: "expand",
+                                   transition: .immediate)
+            self.leaveButton = .init()
+            self.leaveButton.update(size: bottomButtonsSize,
+                                    content: .init(appearance: .color(.green), image: .end),
+                                   text: "leave",
+                                   transition: .immediate)
+            self.streamPreview = .init()
+            self.videoRenderingContext = VideoRenderingContext()
+            super.init()
+            self.setupViews()
+        }
+        
+        func setupViews() {
+            self.layer.masksToBounds = false
+            self.addSubnode(dimNode)
+            self.dimNode.backgroundColor = .init(white: 0, alpha: 0.7)
+            
+            self.addSubnode(self.contentContainer)
+            self.contentContainer.backgroundColor = .clear
+            self.contentContainer.addSubnode(self.backgroundNode)
+            self.contentContainer.isHidden = true
+            
+            self.backgroundNode.backgroundColor = panelBackgroundColor
+            self.backgroundNode.layer.maskedCorners = [.layerMinXMinYCorner,
+                                                       .layerMaxXMinYCorner]
+            self.backgroundNode.layer.cornerRadius = 20
+            self.backgroundNode.layer.masksToBounds = true
+            
+            self.controller?.dataReady.set(true)
+            self.controller?.audioOutputStateReady.set(true)
+            
+            
+            panGestureRecognizer = UIPanGestureRecognizer(target: self,
+                                                          action: #selector(panGesture))
+            self.view.addGestureRecognizer(panGestureRecognizer!)
+        }
+        
+        func animateIn() {
+            guard let (layout, _) = self.validLayout else {
+                return
+            }
+            
+            self.dimNode.alpha = 1
+            self.visibility = true
+            self.animatingAppearance = true
+            
+            let size = layout.size
+            let initialBounds = CGRect(origin: .zero,
+                                       size: size)
+            self.contentContainer.bounds = initialBounds
+                .offsetBy(dx: 0, dy: -size.height)
+            self.contentContainer.isHidden = false
+            
+            let transition = ContainedViewLayoutTransition.animated(duration: 0.4,
+                                                                    curve: .spring)
+            transition.animateView({
+                self.contentContainer.view.bounds = initialBounds
+            }, completion: { _ in
+                self.animatingAppearance = false
+                
+                self.controller?.currentOverlayController?.dismiss()
+                self.controller?.currentOverlayController = nil
+            })
+            self.dimNode.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.3)
+            
+        }
+        
+        func animateOut(completion: (() -> Void)?) {
+            guard let (layout, _) = self.validLayout else {
+                return
+            }
+            
+            self.dimNode.alpha = 0
+            self.visibility = false
+            self.animatingAppearance = true
+            
+            let size = layout.size
+            let initialBounds = CGRect(origin: .zero,
+                                       size: size)
+            let transition = ContainedViewLayoutTransition.animated(duration: 0.4,
+                                                                    curve: .spring)
+            transition.animateView({
+                self.contentContainer.view.bounds = initialBounds.offsetBy(dx: 0,
+                                                                    dy: -size.height)
+            }, completion: { _ in
+                self.animatingAppearance = false
+                
+                self.controller?.currentOverlayController?.dismiss()
+                self.controller?.currentOverlayController = nil
+                completion?()
+            })
+            self.dimNode.layer.animateAlpha(from: 1.0, to: 0, duration: 0.3)
+        }
+        
+        func containerLayoutUpdated(_ layout: ContainerViewLayout,
+                                    navigationHeight: CGFloat,
+                                    transition: ContainedViewLayoutTransition) {
+            
+            let isFirstTime = self.validLayout == nil
+            self.validLayout = (layout, navigationHeight)
+            let frame: CGRect = .init(origin: .zero,
+                                      size: layout.size)
+            self.dimNode.frame = .init(x: 0, y: -layout.size.height * 0.7,
+                                       width: layout.size.width,
+                                       height: layout.size.height * 1.4)
+            self.contentContainer.frame = frame
+            self.backgroundNode.frame = frame.offsetBy(dx: 0,
+                                                       dy: 0.3 * frame.height)
+            
+            if isFirstTime {
+                self.controller?.contentsReady.set(true)
+            }
+        }
+        
+        @objc
+        private func panGesture(_ recognizer: UIPanGestureRecognizer) {
+            let state = recognizer.state
+            switch state {
+            case .began:
+                self.initialContentViewYOrigin = self.contentContainer.frame.minY
+            case .changed:
+                let translation = recognizer.translation(in: self.view)
+                let y = max(0, self.initialContentViewYOrigin + translation.y)
+                self.contentContainer.frame.origin.y = y
+            case .ended:
+                let translation = recognizer.translation(in: self.view)
+                let velocity = recognizer.velocity(in: self.view)
+                if translation.y >= 150 || velocity.y >= 300 {
+                    controller?.dismiss(closing: false, manual: true)
+                } else {
+                    let bounds = CGRect(origin: .zero,
+                                        size: self.contentContainer.frame.size)
+                    let transition = ContainedViewLayoutTransition.animated(duration: 0.4, curve: .spring)
+                    transition.animateView({
+                        self.contentContainer.view.bounds = bounds
+                    }, completion: { _ in
+                        self.animatingAppearance = false
+                        
+                        self.controller?.currentOverlayController?.dismiss()
+                        self.controller?.currentOverlayController = nil
+                    })
+                }
+            default:
+                break
+            }
+        }
+    }
+   
+    private let sharedContext: SharedAccountContext
+    public let call: PresentationGroupCall
+    private let presentationData: PresentationData
+    public var parentNavigationController: NavigationController?
+        
+    fileprivate let contentsReady = ValuePromise<Bool>(false, ignoreRepeated: true)
+    fileprivate let dataReady = ValuePromise<Bool>(false, ignoreRepeated: true)
+    fileprivate let audioOutputStateReady = ValuePromise<Bool>(false, ignoreRepeated: true)
+    private let _ready = Promise<Bool>(false)
+    override public var ready: Promise<Bool> {
+        return self._ready
+    }
+    
+    public var onViewDidAppear: (() -> Void)?
+    public var onViewDidDisappear: (() -> Void)?
+    private var reclaimActionButton: (() -> Void)?
+    
+    private var didAppearOnce: Bool = false
+    private var isDismissed: Bool = false
+    private var isDisconnected: Bool = false
+    
+    private var controllerNode: Node {
+        return self.displayNode as! Node
+    }
+    
+    private let idleTimerExtensionDisposable = MetaDisposable()
+    
+    public weak var currentOverlayController: VoiceChatOverlayController?
+    
+    private var validLayout: ContainerViewLayout?
+    
+    public init(sharedContext: SharedAccountContext, accountContext: AccountContext, call: PresentationGroupCall) {
+        self.sharedContext = sharedContext
+        self.call = call
+        self.presentationData = sharedContext.currentPresentationData.with { $0 }
+        
+        super.init(navigationBarPresentationData: nil)
+        
+        self.automaticallyControlPresentationContextLayout = false
+        self.blocksBackgroundWhenInOverlay = true
+        
+        self.supportedOrientations = ViewControllerSupportedOrientations(regularSize: .all, compactSize: .all)
+                 
+        self.statusBar.statusBarStyle = .Ignore
+        
+        self._ready.set(combineLatest([
+            self.contentsReady.get(),
+            self.dataReady.get(),
+            self.audioOutputStateReady.get()
+        ])
+        |> map { values -> Bool in
+            for value in values {
+                if !value {
+                    return false
+                }
+            }
+            return true
+        }
+        |> filter { $0 })
+    }
+    
+    required init(coder aDecoder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    public override func viewDidLoad() {
+        super.viewDidLoad()
+        view.clipsToBounds = false
+    }
+    
+    deinit {
+        self.idleTimerExtensionDisposable.dispose()
+        
+        if let currentOverlayController = self.currentOverlayController {
+            currentOverlayController.animateOut(reclaim: false, targetPosition: CGPoint(), completion: { _ in })
+        }
+    }
+    
+    override public func loadDisplayNode() {
+        self.displayNode = Node(controller: self, sharedContext: self.sharedContext, call: self.call)
+        
+        self.displayNodeDidLoad()
+    }
+        
+    override public func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        
+        self.isDismissed = false
+        
+        if !self.didAppearOnce {
+            self.didAppearOnce = true
+            
+            self.reclaimActionButton?()
+            self.controllerNode.animateIn()
+            
+            self.idleTimerExtensionDisposable.set(self.sharedContext.applicationBindings.pushIdleTimerExtension())
+        }
+        
+        DispatchQueue.main.async {
+            self.onViewDidAppear?()
+        }
+    }
+    
+    override public func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        
+        self.idleTimerExtensionDisposable.set(nil)
+        
+        DispatchQueue.main.async {
+            self.didAppearOnce = false
+            self.isDismissed = true
+            self.detachActionButton()
+            self.onViewDidDisappear?()
+        }
+    }
+        
+    private var dismissedManually: Bool = false
+    public func dismiss(closing: Bool, manual: Bool = false) {
+        if closing {
+            self.isDisconnected = true
+        } else {
+            if let navigationController = self.navigationController as? NavigationController {
+                let count = navigationController.viewControllers.count
+                if count == 2 || navigationController.viewControllers[count - 2] is ChatController {
+                    if let chatController = navigationController.viewControllers[count - 2] as? ChatController, chatController.isSendButtonVisible {
+                    } else if let tabBarController = navigationController.viewControllers[count - 2] as? TabBarController, let chatListController = tabBarController.controllers[tabBarController.selectedIndex] as? ChatListController, chatListController.isSearchActive {
+                    } else {
+                        if manual {
+                            self.dismissedManually = true
+                            Queue.mainQueue().after(0.05) {
+                                self.detachActionButton()
+                            }
+                        } else {
+                            self.detachActionButton()
+                        }
+                    }
+                }
+            }
+        }
+        
+        self.dismiss()
+    }
+    
+    private func dismissAllTooltips() {
+        self.window?.forEachController({ controller in
+            if let controller = controller as? UndoOverlayController {
+                controller.dismissWithCommitAction()
+            }
+        })
+//        self.forEachController({ controller in
+//            if let controller = controller as? UndoOverlayController {
+//                controller.dismissWithCommitAction()
+//            }
+//            if let controller = controller as? TooltipScreen {
+//                controller.dismiss()
+//            }
+//            return true
+//        })
+    }
+
+    private func detachActionButton() {
+        guard self.currentOverlayController == nil && !self.isDisconnected else {
+            return
+        }
+//        let overlay = OverlayMediaController
+//        let overlayController = VoiceChatOverlayController(actionButton: self.controllerNode.actionButton, audioOutputNode: self.controllerNode.audioButton, cameraNode: self.controllerNode.cameraButton, leaveNode: self.controllerNode.leaveButton, navigationController: self.navigationController as? NavigationController, initiallyHidden: self.dismissedManually)
+//        if let navigationController = self.navigationController as? NavigationController {
+//            navigationController.presentOverlay(controller: overlayController, inGlobal: true, blockInteraction: false)
+//        }
+//
+//        self.currentOverlayController = overlayController
+//        self.dismissedManually = false
+//
+//        self.reclaimActionButton = { [weak self, weak overlayController] in
+//
+//        }
+    }
+    
+    override public func dismiss(completion: (() -> Void)? = nil) {
+        if !self.isDismissed {
+            self.isDismissed = true
+            self.didAppearOnce = false
+            
+            self.controllerNode.animateOut(completion: { [weak self] in
+                completion?()
+                self?.dismiss(animated: false)
+            })
+
+            DispatchQueue.main.async {
+                self.onViewDidDisappear?()
+            }
+        }
+    }
+    
+    override public func containerLayoutUpdated(_ layout: ContainerViewLayout, transition: ContainedViewLayoutTransition) {
+        super.containerLayoutUpdated(layout, transition: transition)
+        self.validLayout = layout
+        self.controllerNode.containerLayoutUpdated(layout, navigationHeight: self.navigationLayout(layout: layout).navigationFrame.maxY, transition: transition)
+    }
+    
+
+}
+
+
+// MARK: - Old StreamController
 
 final class NavigationBackButtonComponent: Component {
     let text: String
@@ -1377,3 +1797,5 @@ public final class MediaStreamComponentController: ViewControllerComponentContai
         })
     }
 }
+
+
