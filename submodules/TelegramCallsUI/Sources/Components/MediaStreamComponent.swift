@@ -19,6 +19,7 @@ import BundleIconComponent
 import CreateExternalMediaStreamScreen
 import HierarchyTrackingLayer
 import UndoPanelComponent
+import AnimatedCountLabelNode
 
 // MARK: - New StreamController
 
@@ -26,6 +27,177 @@ public final class MediaStreamController: ViewController, VoiceChatController {
     
     fileprivate final class Node: ViewControllerTracingNode, UIGestureRecognizerDelegate {
         
+        public class Button: UIButton {
+            
+            public override var isHighlighted: Bool {
+                didSet {
+                    if oldValue != isHighlighted {
+                        UIView.animate(withDuration: 0.2) {
+                            if self.isHighlighted {
+                                self.transform = self.transform.scaledBy(x: 0.8, y: 0.8)
+                            } else {
+                                self.transform = .identity
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        final public class MediaStreamButton: Button {
+            
+            private var image: UIImage?
+            
+            private var actionBlock: (() -> Void)?
+            
+            override init(frame: CGRect) {
+                super.init(frame: frame)
+                self.addTarget(self, action: #selector(handleTap),
+                               for: .touchUpInside)
+                imageView?.contentMode = .center
+                tintColor = .white
+            }
+            
+            required init?(coder: NSCoder) {
+                fatalError("init(coder:) has not been implemented")
+            }
+            
+            func setup(image: UIImage?,
+                       color: UIColor?,
+                       action: (() -> Void)?) {
+                self.image = image
+                self.backgroundColor = color
+                self.actionBlock = action
+                self.setImage(image, for: .normal)
+            }
+            
+            @objc
+            private func handleTap() {
+                actionBlock?()
+            }
+            
+        }
+        
+        final public class MediaStreamTitleView: UIView {
+            
+            public enum LiveState {
+                case on, off
+                
+                var color: UIColor {
+                    switch self {
+                    case .on:
+                        return UIColor(hexString: "F02D52")!
+                    case .off:
+                        return UIColor(hexString: "979898")!
+                    }
+                }
+            }
+            
+            public var title: String
+            
+            public var liveState: LiveState
+            
+            let titleLabel = UILabel()
+            
+            let liveLabel = UILabel()
+            
+            init(title: String, liveState: LiveState) {
+                self.title = title
+                self.liveState = liveState
+                super.init(frame: .zero)
+                
+                self.addSubview(self.titleLabel)
+                self.addSubview(self.liveLabel)
+                
+                self.titleLabel.text = title
+                self.titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+                self.titleLabel.textColor = .white
+                self.titleLabel.textAlignment = .center
+                
+                self.liveLabel.layer.backgroundColor = liveState.color.cgColor
+                self.liveLabel.layer.cornerRadius = 11
+                self.liveLabel.clipsToBounds = true
+                self.liveLabel.textAlignment = .center
+                self.liveLabel.text = "LIVE"
+                self.liveLabel.font = .systemFont(ofSize: 11, weight: .bold)
+                self.liveLabel.textColor = .white
+            }
+            
+            public override func layoutSubviews() {
+                super.layoutSubviews()
+                self.layout()
+            }
+            
+            func layout() {
+                let width = self.frame.width
+                self.titleLabel.sizeToFit()
+                let liveWidth: CGFloat = 38
+                let space: CGFloat = 6
+                let height: CGFloat = 22
+                let titleWidth = min(self.titleLabel.frame.width,
+                                     width - liveWidth - space)
+                let offset = (width - titleWidth - space - liveWidth) / 2
+                self.titleLabel.frame = CGRect(x: offset,
+                                               y: 6,
+                                               width: titleWidth,
+                                               height: height)
+                self.liveLabel.frame = CGRect(x: width - offset - liveWidth,
+                                              y: 6,
+                                              width: liveWidth,
+                                              height: height)
+            }
+            
+            required init?(coder: NSCoder) {
+                fatalError("init(coder:) has not been implemented")
+            }
+            
+            func setLiveState(_ state: LiveState, animated: Bool = true) {
+                self.liveState = state
+                if animated {
+                    let duration: Double = 0.5
+                    var animations: [CABasicAnimation] = []
+                    
+                    let scaleAnimation1 = CABasicAnimation(keyPath: "transform.scale")
+                    scaleAnimation1.fromValue = 1
+                    scaleAnimation1.toValue = 1.2
+                    scaleAnimation1.duration = duration * 0.4
+                    scaleAnimation1.isRemovedOnCompletion = false
+                    scaleAnimation1.timingFunction = .init(name: .easeOut)
+                    animations.append(scaleAnimation1)
+                    
+                    let scaleAnimation2 = CABasicAnimation(keyPath: "transform.scale")
+                    scaleAnimation2.fromValue = 1.2
+                    scaleAnimation2.toValue = 0.9
+                    scaleAnimation2.duration = duration * 0.4
+                    scaleAnimation2.beginTime = duration * 0.4
+                    scaleAnimation2.isRemovedOnCompletion = false
+                    animations.append(scaleAnimation2)
+                    
+                    let scaleAnimation3 = CABasicAnimation(keyPath: "transform.scale")
+                    scaleAnimation3.fromValue = 0.9
+                    scaleAnimation3.toValue = 1
+                    scaleAnimation3.duration = duration * 0.2
+                    scaleAnimation3.beginTime = duration  * 0.8
+                    scaleAnimation3.isRemovedOnCompletion = false
+                    animations.append(scaleAnimation3)
+                    
+                    let colorAnimation = CABasicAnimation(keyPath: "backgroundColor")
+                    colorAnimation.fromValue = self.liveLabel.layer.backgroundColor
+                    colorAnimation.toValue = state.color.cgColor
+                    colorAnimation.duration = duration
+                    colorAnimation.isRemovedOnCompletion = false
+                    animations.append(colorAnimation)
+                    
+                    let animationsGroup = CAAnimationGroup()
+                    animationsGroup.animations = animations
+                    animationsGroup.duration = duration
+                    animationsGroup.timingFunction = .init(name: .easeOut)
+                    self.liveLabel.layer.add(animationsGroup, forKey: nil)
+                }
+                self.liveLabel.layer.backgroundColor = state.color.cgColor
+            }
+        }
+
         private struct ListTransition {
             let deletions: [ListViewDeleteItem]
             let insertions: [ListViewInsertItem]
@@ -45,81 +217,304 @@ public final class MediaStreamController: ViewController, VoiceChatController {
         let backgroundNode: ASDisplayNode
         let dimNode: ASDisplayNode
         let contentContainer: ASDisplayNode
-        let optionsButton: VoiceChatHeaderButton
-        let pictureInPictureButton: VoiceChatHeaderButton
-        let membersNumberLabel: ASTextNode
-        let watchingLabel: ASTextNode
-        let shareButton: CallControllerButtonItemNode
-        let leaveButton: CallControllerButtonItemNode
-        let expandButton: CallControllerButtonItemNode
+        let contentContainerBackgroundNode: ASDisplayNode
+        let titleView: MediaStreamTitleView
+        let optionsButton: MediaStreamButton
+        let pictureInPictureButton: MediaStreamButton
+        let membersNumberLabel: ImmediateAnimatedCountLabelNode
+        let watchingLabel: UILabel
+        let buttonsStackView: UIStackView
+        let shareButton: MediaStreamButton
+        let leaveButton: MediaStreamButton
+        let expandButton: MediaStreamButton
+        let labelsStackView: UIStackView
+        let shareLabel: UILabel
+        let expandLabel: UILabel
+        let leaveLabel: UILabel
+        
         let streamPreview: ASImageNode
         
         private var videoRenderingContext: VideoRenderingContext
         var streamVideoNode: GroupVideoNode?
         
         var panGestureRecognizer: UIPanGestureRecognizer?
+        var tapGestureRecognizer: UITapGestureRecognizer?
         
         var visibility = false
         var animatingAppearance = false
+        var ignoreLayout = false
         private var validLayout: (ContainerViewLayout, CGFloat)?
         private var initialContentViewYOrigin: CGFloat = 0.0
+        
+        var optionsImage: UIImage? {
+            return UIImage(named: "stream.ellipsis")
+        }
+        
+        var pictureInPictureImage: UIImage? {
+            return UIImage(named: "stream.pip.enter")
+        }
+        
+        var expandImage: UIImage? {
+            return UIImage(named: "stream.expand")
+        }
+        
+        var shareImage: UIImage? {
+            return UIImage(named: "stream.share")
+        }
+        
+        var leaveImage: UIImage? {
+            return UIImage(named: "stream.leave")
+        }
         
         init(controller: MediaStreamController, sharedContext: SharedAccountContext, call: PresentationGroupCall) {
             self.controller = controller
             self.sharedContext = sharedContext
             self.context = call.accountContext
-            self.backgroundNode = .init()
-            self.dimNode = .init()
-            self.contentContainer = .init()
-            self.optionsButton = .init(context: self.context)
-            self.pictureInPictureButton = .init(context: self.context)
-            self.membersNumberLabel = .init()
-            self.watchingLabel = .init()
-            self.shareButton = .init()
-            let bottomButtonsSize = CGSize(width: 80, height: 80)
-            self.shareButton.update(size: bottomButtonsSize,
-                                   content: .init(appearance: .color(.green), image: .share),
-                                   text: "share",
-                                   transition: .immediate)
-            self.expandButton = .init()
-            self.expandButton.update(size: bottomButtonsSize,
-                                     content: .init(appearance: .color(.green), image: .flipCamera),
-                                   text: "expand",
-                                   transition: .immediate)
-            self.leaveButton = .init()
-            self.leaveButton.update(size: bottomButtonsSize,
-                                    content: .init(appearance: .color(.green), image: .end),
-                                   text: "leave",
-                                   transition: .immediate)
-            self.streamPreview = .init()
+            self.backgroundNode = ASDisplayNode()
+            self.dimNode = ASDisplayNode()
+            self.contentContainer = ASDisplayNode()
+            self.contentContainerBackgroundNode = ASDisplayNode()
+            self.optionsButton = MediaStreamButton()
+            self.pictureInPictureButton = MediaStreamButton()
+            self.membersNumberLabel = ImmediateAnimatedCountLabelNode()
+            self.watchingLabel = UILabel()
+            self.shareButton = MediaStreamButton()
+            self.expandButton = MediaStreamButton()
+            self.leaveButton = MediaStreamButton()
+            self.streamPreview = ASImageNode()
             self.videoRenderingContext = VideoRenderingContext()
+            self.titleView = MediaStreamTitleView(title: "Telesporty",
+                                                  liveState: .off)
+            self.buttonsStackView = UIStackView()
+            self.shareLabel = UILabel()
+            self.expandLabel = UILabel()
+            self.leaveLabel = UILabel()
+            self.labelsStackView = UIStackView()
             super.init()
             self.setupViews()
         }
         
         func setupViews() {
-            self.layer.masksToBounds = false
-            self.addSubnode(dimNode)
-            self.dimNode.backgroundColor = .init(white: 0, alpha: 0.7)
+            self.addSubnode(self.dimNode)
+            self.dimNode.backgroundColor = .init(white: 0, alpha: 0.4)
             
             self.addSubnode(self.contentContainer)
             self.contentContainer.backgroundColor = .clear
+            self.contentContainer.addSubnode(self.contentContainerBackgroundNode)
             self.contentContainer.addSubnode(self.backgroundNode)
             self.contentContainer.isHidden = true
             
             self.backgroundNode.backgroundColor = panelBackgroundColor
             self.backgroundNode.layer.maskedCorners = [.layerMinXMinYCorner,
                                                        .layerMaxXMinYCorner]
-            self.backgroundNode.layer.cornerRadius = 20
+            self.backgroundNode.layer.cornerRadius = 10
             self.backgroundNode.layer.masksToBounds = true
             
             self.controller?.dataReady.set(true)
             self.controller?.audioOutputStateReady.set(true)
             
+            self.panGestureRecognizer = UIPanGestureRecognizer(target: self,
+                                                               action: #selector(handlePanGesture))
+            self.tapGestureRecognizer = UITapGestureRecognizer(target: self,
+                                                               action: #selector(handleTapGesture))
+            self.view.addGestureRecognizer(self.panGestureRecognizer!)
+            self.contentContainerBackgroundNode.view
+                .addGestureRecognizer(self.tapGestureRecognizer!)
             
-            panGestureRecognizer = UIPanGestureRecognizer(target: self,
-                                                          action: #selector(panGesture))
-            self.view.addGestureRecognizer(panGestureRecognizer!)
+            self.optionsButton.layer.cornerRadius = 17
+            self.optionsButton.clipsToBounds = true
+            self.optionsButton.setup(image: self.optionsImage,
+                                     color: secondaryPanelBackgroundColor,
+                                     action: self.handleOptionsTapped)
+            
+            self.pictureInPictureButton.layer.cornerRadius = 17
+            self.pictureInPictureButton.clipsToBounds = true
+            self.pictureInPictureButton.setup(image: self.pictureInPictureImage,
+                                              color: secondaryPanelBackgroundColor,
+                                              action: self.handlePictureInPictureTapped)
+            
+            let backgroundView = self.backgroundNode.view
+            
+            backgroundView.addSubview(self.optionsButton)
+            backgroundView.addSubview(self.pictureInPictureButton)
+            backgroundView.addSubview(self.titleView)
+            backgroundView.addSubview(self.streamPreview.view)
+            backgroundView.addSubview(self.membersNumberLabel.view)
+            backgroundView.addSubview(self.watchingLabel)
+            backgroundView.addSubview(self.buttonsStackView)
+            backgroundView.addSubview(self.labelsStackView)
+            
+            self.streamPreview.backgroundColor = .lightGray
+            self.streamPreview.layer.cornerRadius = 10
+            
+//            self.membersNumberLabel.val
+//            self.membersNumberLabel.text = "84,249"
+//            self.membersNumberLabel.font = .systemFont(ofSize: 42,
+//                                                       weight: .semibold)
+//            self.membersNumberLabel.textColor = .systemBlue
+//            self.membersNumberLabel.textAlignment = .center
+            self.setMembersCount(84249, animated: false)
+            
+            self.watchingLabel.text = "watching"
+            self.watchingLabel.textColor = .white
+            self.watchingLabel.font = .systemFont(ofSize: 16, weight: .semibold)
+            self.watchingLabel.textAlignment = .center
+            
+            let bottomButtonsSize = CGSize(width: 60, height: 60)
+            self.shareButton.setup(image: shareImage,
+                                   color: UIColor(hexString: "2A2C5B"),
+                                   action: self.handleShareTapped)
+            self.shareButton.frame.size = bottomButtonsSize
+            self.shareButton.layer.cornerRadius = bottomButtonsSize.width / 2
+            self.shareButton.clipsToBounds = true
+            self.expandButton.setup(image: expandImage,
+                                    color: UIColor(hexString: "392948"),
+                                    action: self.handleShareTapped)
+            self.expandButton.frame.size = bottomButtonsSize
+            self.expandButton.layer.cornerRadius = bottomButtonsSize.width / 2
+            self.expandButton.clipsToBounds = true
+            self.leaveButton.setup(image: leaveImage,
+                                   color: UIColor(hexString: "502932"),
+                                   action: self.handleLeaveTapped)
+            self.leaveButton.frame.size = bottomButtonsSize
+            self.leaveButton.layer.cornerRadius = bottomButtonsSize.width / 2
+            self.leaveButton.clipsToBounds = true
+            
+            self.buttonsStackView.axis = .horizontal
+            self.buttonsStackView.distribution = .fillEqually
+            self.buttonsStackView.addArrangedSubview(self.shareButton)
+            self.buttonsStackView.addArrangedSubview(self.expandButton)
+            self.buttonsStackView.addArrangedSubview(self.leaveButton)
+            
+            self.shareLabel.text = "share"
+            self.shareLabel.textColor = .white
+            self.shareLabel.font = .systemFont(ofSize: 14)
+            self.shareLabel.textAlignment = .center
+            
+            self.expandLabel.text = "expand"
+            self.expandLabel.textColor = .white
+            self.expandLabel.font = .systemFont(ofSize: 14)
+            self.expandLabel.textAlignment = .center
+            
+            self.leaveLabel.text = "leave"
+            self.leaveLabel.textColor = .white
+            self.leaveLabel.font = .systemFont(ofSize: 14)
+            self.leaveLabel.textAlignment = .center
+            
+            self.labelsStackView.axis = .horizontal
+            self.labelsStackView.distribution = .fillEqually
+            self.labelsStackView.spacing = 60
+            
+            self.labelsStackView.addArrangedSubview(self.shareLabel)
+            self.labelsStackView.addArrangedSubview(self.expandLabel)
+            self.labelsStackView.addArrangedSubview(self.leaveLabel)
+        }
+        
+        private func setMembersCount(_ count: Int, animated: Bool) {
+            let font: UIFont = Font.with(size: 50.0, design: .round,
+                                         weight: .semibold, traits: [.monospacedNumbers])
+            let textColor: UIColor = .systemBlue
+            var segments: [AnimatedCountLabelNode.Segment] = [
+            ]
+            var count = count
+            var textCount = 0
+            while count > 0  {
+                if segments.count > 0 && segments.count % 3 == 0 {
+                    segments.append(.text(textCount, .init(string: ",", font: font,
+                                                           textColor: textColor)))
+                    textCount += 1
+                }
+                let remainder = count % 10
+                segments.append(.number(remainder, .init(string: "\(remainder)",
+                                                         font: font,
+                                                         textColor: textColor)))
+                count /= 10
+            }
+            self.membersNumberLabel.segments = segments.reversed()
+            let viewSize = CGSize(width: self.backgroundNode.view.frame.width,
+                                  height: 60)
+            let size = self.membersNumberLabel
+                .updateLayout(size: viewSize,
+                              animated: animated)
+            
+            let width = self.backgroundNode.frame.width
+            let membersLabelOffset = max((width - size.width) / 2, 0)
+            self.membersNumberLabel.frame = CGRect(x: membersLabelOffset,
+                             y: self.streamPreview.frame.maxY + 35,
+                             width: width - 2 * membersLabelOffset,
+                             height: 60)
+        }
+        
+        func layoutViews() {
+            guard let (layout, _) = self.validLayout else {
+                return
+            }
+            let width = layout.size.width
+            
+            self.optionsButton.frame = CGRect(x: 20, y: 12,
+                                              width: 34, height: 34)
+            self.pictureInPictureButton.frame = CGRect(x: width - 54, y: 12,
+                                                       width: 34, height: 34)
+            self.titleView.frame = CGRect(x: 64, y: 12,
+                                          width: width - 128, height: 34)
+            
+            let streamViewSize: CGSize = CGSize(width: width - 32,
+                                                height: (width - 32) / 16 * 9)
+            self.streamPreview.frame = CGRect(x: 16,
+                                              y: self.titleView.frame.maxY + 10,
+                                              width: streamViewSize.width,
+                                              height: streamViewSize.height)
+            
+            let membersLabelSize = self.membersNumberLabel
+                .updateLayout(size: CGSize(width: width, height: 60),
+                              animated: false)
+            
+            
+            let membersLabelOffset = max((width - membersLabelSize.width) / 2, 0)
+            self.membersNumberLabel.frame = CGRect(x: membersLabelOffset,
+                             y: self.streamPreview.frame.maxY + 35,
+                             width: width - 2 * membersLabelOffset,
+                             height: 60)
+            
+            self.membersNumberLabel.contentMode = .center
+            
+            self.watchingLabel.frame = CGRect(x: 0,
+                                              y: self.membersNumberLabel.frame.maxY + 2,
+                                              width: width,
+                                              height: 18)
+            
+            let buttonsSpace = (width - 3 * 60) / 4
+            self.buttonsStackView.frame = CGRect(x: buttonsSpace,
+                                                 y: self.watchingLabel.frame.maxY + 35,
+                                                 width: width - 2 * buttonsSpace,
+                                                 height: 60)
+            
+            self.labelsStackView.frame = CGRect(x: buttonsSpace,
+                                                y: self.watchingLabel.frame.maxY + 97,
+                                                width: width - 2 * buttonsSpace,
+                                                height: 18)
+            self.buttonsStackView.spacing = buttonsSpace
+        }
+        
+        func calculateBackgroundHeight(_ width: CGFloat) -> CGFloat {
+            var height: CGFloat = 12
+            height += 34
+            height += 10
+            height += (width - 40) / 16 * 9
+            height += 35
+            height += 50
+            height += 2
+            height += 18
+            height += 35
+            height += 80
+            height += 40
+            height += bottomHeight()
+            return height
+        }
+        
+        private func bottomHeight() -> CGFloat {
+            guard let window = UIApplication.shared.windows.first else { return 0 }
+            return window.safeAreaInsets.bottom
         }
         
         func animateIn() {
@@ -150,6 +545,12 @@ public final class MediaStreamController: ViewController, VoiceChatController {
             })
             self.dimNode.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.3)
             
+            self.titleView.setLiveState(.off, animated: false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.titleView.setLiveState(.on)
+                self.setMembersCount(Int.random(in: 1000...19999),
+                                     animated: true)
+            }
         }
         
         func animateOut(completion: (() -> Void)?) {
@@ -157,6 +558,7 @@ public final class MediaStreamController: ViewController, VoiceChatController {
                 return
             }
             
+            self.ignoreLayout = true
             self.dimNode.alpha = 0
             self.visibility = false
             self.animatingAppearance = true
@@ -174,6 +576,7 @@ public final class MediaStreamController: ViewController, VoiceChatController {
                 
                 self.controller?.currentOverlayController?.dismiss()
                 self.controller?.currentOverlayController = nil
+                self.ignoreLayout = false
                 completion?()
             })
             self.dimNode.layer.animateAlpha(from: 1.0, to: 0, duration: 0.3)
@@ -182,25 +585,33 @@ public final class MediaStreamController: ViewController, VoiceChatController {
         func containerLayoutUpdated(_ layout: ContainerViewLayout,
                                     navigationHeight: CGFloat,
                                     transition: ContainedViewLayoutTransition) {
-            
+            guard !ignoreLayout else { return }
             let isFirstTime = self.validLayout == nil
             self.validLayout = (layout, navigationHeight)
             let frame: CGRect = .init(origin: .zero,
                                       size: layout.size)
-            self.dimNode.frame = .init(x: 0, y: -layout.size.height * 0.7,
-                                       width: layout.size.width,
-                                       height: layout.size.height * 1.4)
+            self.dimNode.frame = frame
             self.contentContainer.frame = frame
-            self.backgroundNode.frame = frame.offsetBy(dx: 0,
-                                                       dy: 0.3 * frame.height)
+            self.contentContainerBackgroundNode.frame = frame
+            let backgroundHeight = calculateBackgroundHeight(frame.width)
+            self.backgroundNode.frame = CGRect(x: 0,
+                                               y: frame.height - backgroundHeight,
+                                               width: frame.width,
+                                               height: backgroundHeight)
             
             if isFirstTime {
                 self.controller?.contentsReady.set(true)
             }
+            layoutViews()
         }
         
         @objc
-        private func panGesture(_ recognizer: UIPanGestureRecognizer) {
+        private func handleTapGesture() {
+            controller?.dismiss(closing: false, manual: true)
+        }
+        
+        @objc
+        private func handlePanGesture(_ recognizer: UIPanGestureRecognizer) {
             let state = recognizer.state
             switch state {
             case .began:
@@ -219,7 +630,7 @@ public final class MediaStreamController: ViewController, VoiceChatController {
                                         size: self.contentContainer.frame.size)
                     let transition = ContainedViewLayoutTransition.animated(duration: 0.4, curve: .spring)
                     transition.animateView({
-                        self.contentContainer.view.bounds = bounds
+                        self.contentContainer.bounds = bounds
                     }, completion: { _ in
                         self.animatingAppearance = false
                         
@@ -230,6 +641,28 @@ public final class MediaStreamController: ViewController, VoiceChatController {
             default:
                 break
             }
+        }
+        
+        // MARK: Actions Handlers
+        
+        func handleOptionsTapped() {
+            
+        }
+        
+        func handlePictureInPictureTapped() {
+            
+        }
+        
+        func handleShareTapped() {
+            
+        }
+        
+        func handleExpandTapped() {
+            
+        }
+        
+        func handleLeaveTapped() {
+            
         }
     }
    
@@ -435,7 +868,6 @@ public final class MediaStreamController: ViewController, VoiceChatController {
     
 
 }
-
 
 // MARK: - Old StreamController
 
