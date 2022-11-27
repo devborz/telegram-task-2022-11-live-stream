@@ -8,6 +8,49 @@ import TelegramVoip
 import AVFoundation
 import LibYuvBinding
 
+private func pixelBufferToImage(_ buffer: CVPixelBuffer) -> UIImage? {
+    let ciImage = CIImage(cvPixelBuffer: buffer)
+    let image = convert(ciImage: ciImage)
+    return image
+}
+
+private func convert(ciImage: CIImage) -> UIImage {
+     let context = CIContext(options: nil)
+     let cgImage = context.createCGImage(ciImage, from: ciImage.extent)!
+     let image = UIImage(cgImage: cgImage)
+     return image
+}
+
+func videoFrameToImage(_ videoFrameData: OngoingGroupCallContext.VideoFrameData) -> UIImage? {
+    switch videoFrameData.buffer {
+    case let .native(buffer):
+        return pixelBufferToImage(buffer.pixelBuffer)
+    case let .i420(buffer):
+        let ioSurfaceProperties = NSMutableDictionary()
+        let options = NSMutableDictionary()
+        options.setObject(ioSurfaceProperties, forKey: kCVPixelBufferIOSurfacePropertiesKey as NSString)
+
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            buffer.width,
+            buffer.height,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            options,
+            &pixelBuffer
+        )
+
+        if let pixelBuffer = pixelBuffer {
+            if copyI420BufferToNV12Buffer(buffer: buffer, pixelBuffer: pixelBuffer) {
+                return pixelBufferToImage(pixelBuffer)
+            }
+        }
+    default:
+        break
+    }
+    return nil
+}
+
 private func sampleBufferFromPixelBuffer(pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
     var maybeFormat: CMVideoFormatDescription?
     let status = CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &maybeFormat)

@@ -676,6 +676,26 @@ public final class SharedAccountContextImpl: SharedAccountContext {
                                         strongSelf.hasGroupCallOnScreenPromise.set(false)
                                     }
                                 }
+                                groupCallController.onFullScreen = { [weak self] orientation in
+                                    if let strongSelf = self {
+                                        let groupCallController = MediaStreamComponentController(call: call)
+                                        groupCallController.initialOrientation = orientation
+                                        groupCallController.onViewDidAppear = { [weak self] in
+                                            if let strongSelf = self {
+                                                strongSelf.hasGroupCallOnScreenPromise.set(true)
+                                            }
+                                        }
+                                        groupCallController.onViewDidDisappear = { [weak self] in
+                                            if let strongSelf = self {
+                                                strongSelf.hasGroupCallOnScreenPromise.set(false)
+                                            }
+                                        }
+                                        groupCallController.navigationPresentation = .flatModal
+                                        groupCallController.parentNavigationController = navigationController
+                                        strongSelf.groupCallController = groupCallController
+                                        navigationController.pushViewController(groupCallController)
+                                    }
+                                }
                                 groupCallController.navigationPresentation = .flatModal
                                 groupCallController.parentNavigationController = navigationController
                                 strongSelf.groupCallController = groupCallController
