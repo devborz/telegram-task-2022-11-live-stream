@@ -126,6 +126,7 @@ public final class MediaStreamController: ViewController, VoiceChatController {
             
             self.reclaimActionButton?()
             self.controllerNode.animateIn()
+            self.controllerNode.updateVideos()
             
             self.idleTimerExtensionDisposable.set(self.sharedContext.applicationBindings.pushIdleTimerExtension())
         }
@@ -139,7 +140,6 @@ public final class MediaStreamController: ViewController, VoiceChatController {
         super.viewDidDisappear(animated)
         
         self.idleTimerExtensionDisposable.set(nil)
-        
         DispatchQueue.main.async {
             self.didAppearOnce = false
             self.isDismissed = true
@@ -161,6 +161,7 @@ public final class MediaStreamController: ViewController, VoiceChatController {
     private var dismissedManually: Bool = false
     public func dismiss(closing: Bool, manual: Bool = false) {
         self.controllerNode.saveLastFrame()
+        self.controllerNode.updateVideos(enabled: false)
         if closing {
             self.isDisconnected = true
         } else {
@@ -186,9 +187,6 @@ public final class MediaStreamController: ViewController, VoiceChatController {
         self.dismiss()
     }
     
-    func dismissAllTooltips() {
-    }
-
     private func detachActionButton() {
         guard self.currentOverlayController == nil && !self.isDisconnected else {
             return

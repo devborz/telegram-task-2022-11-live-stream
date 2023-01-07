@@ -22,7 +22,6 @@ import UndoPanelComponent
 import AnimatedCountLabelNode
 import AvatarNode
 import TelegramVoip
-import LibYuvBinding
 
 private var optionsImage: UIImage? {
     return UIImage(named: "stream.ellipsis")
@@ -46,6 +45,11 @@ private var leaveImage: UIImage? {
 
 
 public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecognizerDelegate {
+    
+    enum State {
+        case partial
+        case fullscreen
+    }
 
     private struct ListTransition {
         let deletions: [ListViewDeleteItem]
@@ -68,32 +72,23 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
     private var didSetContentsReady: Bool = false
     private var didSetDataReady: Bool = false
     
-    let backgroundNode: ASDisplayNode
+    let contentBackgroundNode: ASDisplayNode
+    let contentNode: ASDisplayNode
     let dimNode: ASDisplayNode
-    let contentContainer: ASDisplayNode
-    let contentContainerBackgroundNode: ASDisplayNode
+    let viewNode: ASDisplayNode
+    let backgroundNode: ASDisplayNode
     let titleView: MediaStreamTitleView
     let optionsButton: MediaStreamButton
     let pictureInPictureButton: MediaStreamButton
     let watchersCounterNode: WatchersCounterNode
     let watchingLabel: UILabel
-    let buttonsStackView: UIStackView
-    let shareButton: MediaStreamButton
-    let leaveButton: MediaStreamButton
-    let expandButton: MediaStreamButton
-    let labelsStackView: UIStackView
-    let shareLabel: UILabel
-    let expandLabel: UILabel
-    let leaveLabel: UILabel
+    let shareButton: MediaStreamLargeButton
+    let leaveButton: MediaStreamLargeButton
+    let expandButton: MediaStreamLargeButton
     
-    let avatarNode: AvatarNode
-    let blurView: UIVisualEffectView
-    let blurTintView: UIView
-    let streamContainerView = UIView()
-    
-    private var videoRenderingContext: VideoRenderingContext
-    var videoView: VideoRenderingView? = nil
-    var blurVideoView: VideoRenderingView? = nil
+    let streamView: MediaStreamView
+    var streamBackgroundView = MediaStreamBackgroundView(frame: .zero)
+    let shimmerNode = MediaStreamShimmeringNode()
         
     var panGestureRecognizer: UIPanGestureRecognizer?
     var tapGestureRecognizer: UITapGestureRecognizer?
@@ -126,7 +121,7 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
     private var callSummaryStateDisposable: Disposable?
     private var presentationDataDisposable: Disposable?
     private var currentPeerDisposable: Disposable?
-    private var lastFrameDisposable: Disposable?
+    var lastFrameDisposable: Disposable?
     private let leaveDisposable = MetaDisposable()
     
     var isPictureInPictureSupported: Bool = false {
@@ -138,14 +133,16 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         }
     }
     
+    private var watchersCountTimer: SwiftSignalKit.Timer?
+    
     private var presentationData: PresentationData
-    private var streamIsLive: Bool = false
+    var streamIsLive: Bool = false
     
     static var streamsPreviews: [Int64 : UIImage] = [:]
-    let streamPreviewImageView: UIImageView
     private var streamPreviewImage: UIImage?
-    
     var lastFrameData: OngoingGroupCallContext.VideoFrameData?
+    
+    var state: State = .partial
     
     init(controller: MediaStreamController,
          sharedContext: SharedAccountContext,
@@ -154,37 +151,21 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         self.sharedContext = sharedContext
         self.context = call.accountContext
         self.call = call
-        self.backgroundNode = ASDisplayNode()
+        self.contentNode = ASDisplayNode()
+        self.contentBackgroundNode = ASDisplayNode()
         self.dimNode = ASDisplayNode()
-        self.contentContainer = ASDisplayNode()
-        self.contentContainerBackgroundNode = ASDisplayNode()
+        self.viewNode = ASDisplayNode()
+        self.backgroundNode = ASDisplayNode()
         self.optionsButton = MediaStreamButton()
         self.pictureInPictureButton = MediaStreamButton()
         self.watchersCounterNode = WatchersCounterNode()
         self.watchingLabel = UILabel()
-        self.shareButton = MediaStreamButton()
-        self.expandButton = MediaStreamButton()
-        self.leaveButton = MediaStreamButton()
-        self.avatarNode = AvatarNode(font: avatarPlaceholderFont(size: 42.0))
-        self.streamPreviewImageView = UIImageView()
-        self.videoRenderingContext = VideoRenderingContext()
+        self.shareButton = MediaStreamLargeButton()
+        self.expandButton = MediaStreamLargeButton()
+        self.leaveButton = MediaStreamLargeButton()
         self.titleView = MediaStreamTitleView(title: "",
                                               liveState: .off)
-        self.buttonsStackView = UIStackView()
-        self.shareLabel = UILabel()
-        self.expandLabel = UILabel()
-        self.leaveLabel = UILabel()
-        self.labelsStackView = UIStackView()
-        if #available(iOS 13, *) {
-            self.blurView = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterial))
-            
-        } else {
-            self.blurView = UIVisualEffectView(effect: UIBlurEffect(style: .prominent))
-        }
-        
-        self.blurTintView = UIView()
-        
-        self.blurTintView.alpha = 0.5
+        self.streamView = MediaStreamView(call: call)
         let presentationData = sharedContext.currentPresentationData.with { $0 }
         self.presentationData = presentationData
         self.darkTheme = defaultDarkColorPresentationTheme
@@ -207,15 +188,17 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         self.currentPeerDisposable?.dispose()
         self.leaveDisposable.dispose()
         self.lastFrameDisposable?.dispose()
+        self.watchersCountTimer?.invalidate()
     }
     
     func saveLastFrame() {
         guard let lastFrameData,
               let image = videoFrameToImage(lastFrameData) else { return }
-        print(image)
         let key = self.call.peerId.id._internalGetInt64Value()
         MediaStreamNode.streamsPreviews[key] = image
     }
+    
+    var watchersCount: Int = 0
     
     func setupData() {
         if #available(iOSApplicationExtension 15.0, iOS 15.0, *), AVPictureInPictureController.isPictureInPictureSupported() {
@@ -226,9 +209,10 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         
         self.membersDisposable = (self.call.members |> deliverOnMainQueue).start(next: { [weak self] members in
             guard let strongSelf = self, let members else { return }
-            self?.watchersCounterNode.update(members.totalCount, animated: true)
+            strongSelf.watchersCount = members.totalCount
             if !strongSelf.didSetDataReady {
                 strongSelf.didSetDataReady = true
+                strongSelf.startWatchersCountTimer()
                 strongSelf.controller?.dataReady.set(true)
             }
         })
@@ -239,12 +223,12 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         
         self.callStateDisposable = (self.call.state |> deliverOnMainQueue).start(next: { [weak self] state in
             self?.callState = state
-            self?.update()
+            self?.streamView.setupVideo()
         })
         
         self.callSummaryStateDisposable = (self.call.summaryState |> deliverOnMainQueue).start(next: { [weak self] state in
             self?.callSummaryState = state
-            self?.update()
+            self?.streamView.setupVideo()
         })
         
         let title: Signal<String?, NoError> = self.call.state
@@ -259,11 +243,11 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
                 strongSelf.currentTitle = title ?? EnginePeer(peer).displayTitle(strings: strongSelf.presentationData.strings, displayOrder: strongSelf.presentationData.nameDisplayOrder)
                 
                 let overrideImage: AvatarNodeImageOverride? = nil
-                let size = CGSize(width: strongSelf.avatarNode.frame.size.width,
-                                  height: strongSelf.avatarNode.frame.size.width)
-                let viewHeight = strongSelf.avatarNode.frame.size.height
-                strongSelf.avatarNode.font = avatarPlaceholderFont(size: floor(viewHeight * 16.0 / 37.0))
-                strongSelf.avatarNode.setPeer(context: strongSelf.call.accountContext,
+                let size = CGSize(width: strongSelf.streamView.avatarNode.frame.size.width,
+                                  height: strongSelf.streamView.avatarNode.frame.size.width)
+                let viewHeight = strongSelf.streamView.avatarNode.frame.size.height
+                strongSelf.streamView.avatarNode.font = avatarPlaceholderFont(size: floor(viewHeight * 16.0 / 37.0))
+                strongSelf.streamView.avatarNode.setPeer(context: strongSelf.call.accountContext,
                                                  theme: strongSelf.presentationData.theme,
                                                  peer: EnginePeer(peer),
                                                  overrideImage: overrideImage,
@@ -281,161 +265,82 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         
         self.inviteLinksPromise.set(.single(nil)
         |> then(call.inviteLinks))
-    
     }
     
-    func update() {
-        if self.videoView == nil {
-            if let input = (self.call as! PresentationGroupCallImpl).video(endpointId: "unified") {
-                self.lastFrameDisposable = input.start(next: { [weak self] data in
-                    self?.lastFrameData = data
-                })
-                if let blurVideoView = self.videoRenderingContext
-                    .makeView(input: input, blur: true, forceSampleBufferDisplayLayer: true) {
-                    self.blurVideoView = blurVideoView
-                    
-                    self.streamContainerView.insertSubview(blurVideoView,
-                                                           belowSubview: self.blurTintView)
-                    blurVideoView.layer.cornerRadius = 10
-                    blurVideoView.clipsToBounds = true
-                    blurVideoView.frame = self.streamContainerView.bounds
-                }
-                if let videoView = self.videoRenderingContext
-                    .makeView(input: input, blur: false, forceSampleBufferDisplayLayer: true) {
-                    self.videoView = videoView
-                    
-                    self.streamContainerView.insertSubview(videoView,
-                                                           belowSubview: self.avatarNode.view)
-                    videoView.layer.cornerRadius = 10
-                    videoView.clipsToBounds = true
-                    videoView.frame = self.avatarNode.frame
-        
-                    if let sampleBufferVideoView = videoView as? SampleBufferVideoRenderingView {
-                        if #available(iOS 13.0, *) {
-                            sampleBufferVideoView.sampleBufferLayer.preventsDisplaySleepDuringVideoPlayback = true
-                            print(sampleBufferVideoView.sampleBufferLayer.preventsCapture)
-                            sampleBufferVideoView.sampleBufferLayer.preventsCapture = false
-                        }
-                        
-                        if #available(iOSApplicationExtension 15.0, iOS 15.0, *), AVPictureInPictureController.isPictureInPictureSupported() {
-                            final class PlaybackDelegateImpl: NSObject, AVPictureInPictureSampleBufferPlaybackDelegate {
-                                func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {
-                                    
-                                }
-
-                                func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
-                                    return CMTimeRange(start: .zero, duration: .positiveInfinity)
-                                }
-
-                                func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
-                                    return false
-                                }
-
-                                func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {
-                                }
-
-                                func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) {
-                                    completionHandler()
-                                }
-
-                                public func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
-                                    return false
-                                }
-                            }
-                            let pictureInPictureController = AVPictureInPictureController(contentSource: AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: sampleBufferVideoView.sampleBufferLayer, playbackDelegate: PlaybackDelegateImpl()))
-                            
-                            pictureInPictureController.delegate = controller
-                            pictureInPictureController.canStartPictureInPictureAutomaticallyFromInline = true
-                            pictureInPictureController.requiresLinearPlayback = true
-                            
-                            self.controller?.pictureInPictureController = pictureInPictureController
-                        }
-                    }
-                    videoView.setOnFirstFrameReceived { [weak self] _ in
-                        guard let strongSelf = self else {
-                            return
-                        }
-
-                        if !strongSelf.streamIsLive {
-                            strongSelf.setLive(true, animated: true)
-                        }
-                    }
-                }
-            }
-        }
-        if let videoView = self.videoView {
-            var isVideoVisible = self.isVisible
-            if let pictureInPictureController = self.controller?.pictureInPictureController {
-                if pictureInPictureController.isPictureInPictureActive {
-                    isVideoVisible = true
-                }
-            }
-            
-            videoView.updateIsEnabled(isVideoVisible)
-            
-            var aspect = videoView.getAspect()
-            if aspect <= 0.01 {
-                aspect = 3.0 / 4.0
-            }
-            let availableSize = self.streamContainerView.frame.size
-            let height = availableSize.height
-            let videoSize = CGSize(width: aspect * height,
-                                   height: height).aspectFitted(availableSize)
-            
-            videoView.frame.size = videoSize
-            videoView.center = .init(x: availableSize.width / 2,
-                                     y: availableSize.height / 2)
-            
-        } else if !self.call.hasVideo {
-            if self.streamIsLive {
-                self.setLive(false, animated: true)
-            }
-        }
+    func startWatchersCountTimer() {
+        self.watchersCounterNode.update(self.watchersCount, animated: false)
+        self.watchersCountTimer = .init(timeout: 5, repeat: true, completion: { [weak self] in
+            self?.handleWatchersCountTimer()
+        }, queue: Queue.mainQueue())
+        self.watchersCountTimer?.start()
+    }
+    
+    @objc
+    func handleWatchersCountTimer() {
+        self.watchersCounterNode.update(self.watchersCount, animated: true)
     }
     
     func setLive(_ live: Bool, animated: Bool) {
         self.streamIsLive = live
         self.titleView.setLiveState(live ? .on : .off, animated: animated)
+        self.streamBackgroundView.setImageViewHidden(live)
         if live {
-            self.avatarNode.isHidden = true
-            self.streamPreviewImageView.isHidden = true
+            self.streamView.avatarNode.isHidden = true
+            self.streamView.streamPreviewImageView.isHidden = true
         } else {
             if let image = self.streamPreviewImage {
-                self.streamPreviewImageView.image = image
-                self.streamPreviewImageView.isHidden = false
-                self.avatarNode.isHidden = true
+                self.streamView.streamPreviewImageView.image = image
+                self.streamBackgroundView.setImage(image)
+                self.streamView.streamPreviewImageView.isHidden = false
+                self.streamView.avatarNode.isHidden = true
             } else {
-                self.streamPreviewImageView.isHidden = true
-                self.avatarNode.isHidden = false
+                self.streamView.streamPreviewImageView.isHidden = true
+                self.streamView.avatarNode.isHidden = false
             }
         }
         UIView.animate(withDuration: animated ? 0.5 : 0.0) {
-            self.blurView.alpha = live ? 0.0 : 1.0
+            self.streamView.blurView.alpha = live ? 0.0 : 1.0
         }
+    }
+    
+    func updateVideos(enabled: Bool = true) {
+        guard self.streamView.videoView != nil else { return }
+        var isVisible = enabled
+        
+        if let pictureInPictureController = self.controller?.pictureInPictureController {
+            if pictureInPictureController.isPictureInPictureActive {
+                isVisible = true
+            }
+        }
+            
+        self.streamView.videoView?.updateIsEnabled(isVisible)
+        self.streamView.blurVideoView?.updateIsEnabled(isVisible)
+        self.streamBackgroundView.videoView?.updateIsEnabled(isVisible)
     }
     
     func setupViews() {
         self.addSubnode(self.dimNode)
         self.dimNode.backgroundColor = .init(white: 0, alpha: 0.4)
         
-        self.addSubnode(self.contentContainer)
-        self.contentContainer.backgroundColor = .clear
-        self.contentContainer.addSubnode(self.contentContainerBackgroundNode)
-        self.contentContainer.addSubnode(self.backgroundNode)
-        self.contentContainer.isHidden = true
+        self.addSubnode(self.viewNode)
+        self.viewNode.backgroundColor = .clear
+        self.viewNode.addSubnode(self.backgroundNode)
+        self.viewNode.addSubnode(self.contentBackgroundNode)
+        self.contentBackgroundNode.addSubnode(self.contentNode)
+        self.viewNode.isHidden = true
         
-        self.backgroundNode.backgroundColor = panelBackgroundColor
-        self.backgroundNode.layer.maskedCorners = [.layerMinXMinYCorner,
+        self.contentBackgroundNode.backgroundColor = panelBackgroundColor
+        self.contentBackgroundNode.layer.maskedCorners = [.layerMinXMinYCorner,
                                                    .layerMaxXMinYCorner]
-        self.backgroundNode.layer.cornerRadius = 10
-        self.backgroundNode.layer.masksToBounds = true
+        self.contentBackgroundNode.layer.cornerRadius = 20
+        self.contentBackgroundNode.layer.masksToBounds = true
         
         self.panGestureRecognizer = UIPanGestureRecognizer(target: self,
                                                            action: #selector(handlePanGesture))
         self.tapGestureRecognizer = UITapGestureRecognizer(target: self,
                                                            action: #selector(handleTapGesture))
         self.view.addGestureRecognizer(self.panGestureRecognizer!)
-        self.contentContainerBackgroundNode.view
+        self.backgroundNode.view
             .addGestureRecognizer(self.tapGestureRecognizer!)
         
         self.optionsButton.layer.cornerRadius = 17
@@ -453,39 +358,20 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         self.pictureInPictureButton.setTitleColor(.white, for: .normal)
         self.pictureInPictureButton.alpha = 0
         
-        let backgroundView = self.backgroundNode.view
+        let contentView = self.contentNode.view
         
-        backgroundView.addSubview(self.streamContainerView)
-        self.streamContainerView.addSubview(self.blurTintView)
-        self.streamContainerView.addSubnode(self.avatarNode)
-        self.streamContainerView.addSubview(self.streamPreviewImageView)
-        self.streamContainerView.addSubview(self.blurView)
+        contentView.addSubview(self.streamBackgroundView)
+        contentView.addSubview(self.streamView)
         
-        self.backgroundNode.addSubnode(self.watchersCounterNode)
+        self.contentNode.addSubnode(self.watchersCounterNode)
         
-        backgroundView.addSubview(self.optionsButton)
-        backgroundView.addSubview(self.pictureInPictureButton)
-        backgroundView.addSubview(self.titleView)
-        backgroundView.addSubview(self.watchingLabel)
-        backgroundView.addSubview(self.buttonsStackView)
-        backgroundView.addSubview(self.labelsStackView)
-    
-        self.avatarNode.imageNode.contentMode = .scaleAspectFill
-
-//        self.streamPreviewImageNode.layer.shadowColor = UIColor(white: 0.7,
-//                                                                alpha: 0.7).cgColor
-//        self.streamPreviewImageNode.layer.shadowOpacity = 0.2
-//        self.streamPreviewImageNode.layer.shadowOffset = CGSize(width: 0,
-//                                                                height: 10)
-//        self.streamPreviewImageNode.layer.shadowRadius = 30
-        self.streamPreviewImageView.contentMode = .scaleAspectFill
-        self.streamPreviewImageView.isHidden = true
+        contentView.addSubview(self.optionsButton)
+        contentView.addSubview(self.pictureInPictureButton)
+        contentView.addSubview(self.titleView)
+        contentView.addSubview(self.watchingLabel)
         
-
-        self.blurTintView.backgroundColor = UIColor(white: 0.0, alpha: 0.55)
-        
-        self.streamContainerView.layer.cornerRadius = 10
-        self.streamContainerView.clipsToBounds = true
+        self.streamView.layer.cornerRadius = 10
+        self.streamView.clipsToBounds = true
         
         self.watchersCounterNode.update(0, animated: false)
         
@@ -494,105 +380,118 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         self.watchingLabel.font = .systemFont(ofSize: 16, weight: .semibold)
         self.watchingLabel.textAlignment = .center
         
-        let bottomButtonsSize = CGSize(width: 60, height: 60)
-        self.shareButton.setup(image: shareImage,
+        self.shareButton.setup(title: "share",
+                               image: shareImage,
                                color: UIColor(hexString: "2A2C5B"),
                                action: self.handleShareTapped)
-        self.shareButton.frame.size = bottomButtonsSize
-        self.shareButton.layer.cornerRadius = bottomButtonsSize.width / 2
-        self.shareButton.clipsToBounds = true
-        self.shareButton.setTitleColor(.white, for: .normal)
-        self.expandButton.setup(image: expandImage,
+        self.expandButton.setup(title: "expand",
+                                image: expandImage,
                                 color: UIColor(hexString: "392948"),
                                 action: self.handleExpandTapped)
-        self.expandButton.frame.size = bottomButtonsSize
-        self.expandButton.layer.cornerRadius = bottomButtonsSize.width / 2
-        self.expandButton.clipsToBounds = true
-        self.expandButton.setTitleColor(.white, for: .normal)
-        self.leaveButton.setup(image: leaveImage,
+        self.leaveButton.setup(title: "leave",
+                               image: leaveImage,
                                color: UIColor(hexString: "502932"),
                                action: self.handleLeaveTapped)
-        self.leaveButton.frame.size = bottomButtonsSize
-        self.leaveButton.layer.cornerRadius = bottomButtonsSize.width / 2
-        self.leaveButton.clipsToBounds = true
-        self.leaveButton.setTitleColor(.white, for: .normal)
         
-        self.buttonsStackView.axis = .horizontal
-        self.buttonsStackView.distribution = .fillEqually
-        self.buttonsStackView.addArrangedSubview(self.shareButton)
-        self.buttonsStackView.addArrangedSubview(self.expandButton)
-        self.buttonsStackView.addArrangedSubview(self.leaveButton)
+        contentView.addSubview(self.shareButton)
+        contentView.addSubview(self.expandButton)
+        contentView.addSubview(self.leaveButton)
         
-        self.shareLabel.text = "share"
-        self.shareLabel.textColor = .white
-        self.shareLabel.font = .systemFont(ofSize: 14)
-        self.shareLabel.textAlignment = .center
-        
-        self.expandLabel.text = "expand"
-        self.expandLabel.textColor = .white
-        self.expandLabel.font = .systemFont(ofSize: 14)
-        self.expandLabel.textAlignment = .center
-        
-        self.leaveLabel.text = "leave"
-        self.leaveLabel.textColor = .white
-        self.leaveLabel.font = .systemFont(ofSize: 14)
-        self.leaveLabel.textAlignment = .center
-        
-        self.labelsStackView.axis = .horizontal
-        self.labelsStackView.distribution = .fillEqually
-        
-        self.labelsStackView.addArrangedSubview(self.shareLabel)
-        self.labelsStackView.addArrangedSubview(self.expandLabel)
-        self.labelsStackView.addArrangedSubview(self.leaveLabel)
+        self.streamView.container = self
     }
     
     func layoutViews() {
         guard let (layout, _) = self.validLayout else {
             return
         }
-        let width = layout.size.width
+        let frame: CGRect = .init(origin: .zero,
+                                  size: layout.size)
+        self.dimNode.frame = frame
+        self.viewNode.frame = frame
+        self.backgroundNode.frame = frame
         
-        self.optionsButton.frame = CGRect(x: 20, y: 12,
-                                          width: 34, height: 34)
-        self.pictureInPictureButton.frame = CGRect(x: width - 54, y: 12,
-                                                   width: 34, height: 34)
-        self.titleView.frame = CGRect(x: 64, y: 12,
-                                      width: width - 128, height: 34)
+        self.contentNode.frame.size = layout.size
+        self.contentBackgroundNode.frame.size = layout.size
         
-        let streamViewSize: CGSize = CGSize(width: width - 32,
-                                            height: (width - 32) / 16 * 9)
-        
-        self.streamContainerView.frame = CGRect(x: 16,
-                                                y: self.titleView.frame.maxY + 10,
-                                                width: streamViewSize.width,
-                                                height: streamViewSize.height)
-        self.avatarNode.frame = CGRect(origin: .zero, size: streamViewSize)
-        self.streamPreviewImageView.frame = CGRect(origin: .zero, size: streamViewSize)
-        self.blurView.frame = CGRect(origin: .zero, size: streamViewSize)
-        self.blurTintView.frame = CGRect(origin: .zero, size: streamViewSize)
-    
-        self.watchersCounterNode.updateLayout(CGRect(x: 0,
-                                                y: self.streamContainerView.frame.maxY + 35,
-                                                width: width,
-                                                height: 60))
-        
-        self.watchingLabel.frame = CGRect(x: 0,
-                                          y: self.watchersCounterNode.frame.maxY + 2,
-                                          width: width,
-                                          height: 18)
-        
-        let buttonsSpace = (width - 3 * 60) / 4
-        self.buttonsStackView.frame = CGRect(x: buttonsSpace,
+        self.setContentPosition()
+        self.handleState()
+        self.streamBackgroundView.isHidden = layout.orientation == .landscape
+        if layout.orientation == .portrait {
+            let width = layout.size.width
+            self.optionsButton.frame = CGRect(x: 20, y: 12,
+                                              width: 34, height: 34)
+            self.pictureInPictureButton.frame = CGRect(x: width - 54, y: 12,
+                                                       width: 34, height: 34)
+            self.titleView.frame = CGRect(x: 64, y: 12,
+                                          width: width - 128, height: 34)
+            
+            let streamViewSize: CGSize = CGSize(width: width - 32,
+                                                height: (width - 32) / 16 * 9)
+            self.streamView.frame = CGRect(x: 16,
+                                            y: self.titleView.frame.maxY + 10,
+                                            width: streamViewSize.width,
+                                            height: streamViewSize.height)
+            self.watchersCounterNode.updateLayout(CGRect(x: 0,
+                                                    y: self.streamView.frame.maxY + 35,
+                                                    width: width,
+                                                    height: 60))
+            self.watchingLabel.frame = CGRect(x: 0,
+                                              y: self.watchersCounterNode.frame.maxY + 2,
+                                              width: width,
+                                              height: 18)
+            let buttonsSpace = (width - 3 * 60) / 4
+            var buttonFrame: CGRect = CGRect(x: buttonsSpace,
                                              y: self.watchingLabel.frame.maxY + 35,
-                                             width: width - 2 * buttonsSpace,
-                                             height: 60)
-        
-        self.labelsStackView.frame = CGRect(x: buttonsSpace,
-                                            y: self.watchingLabel.frame.maxY + 97,
-                                            width: width - 2 * buttonsSpace,
-                                            height: 18)
-        self.buttonsStackView.spacing = buttonsSpace
-        self.labelsStackView.spacing = buttonsSpace
+                                             width: 60, height: 80)
+            self.shareButton.frame = buttonFrame
+            buttonFrame.origin.x = buttonsSpace * 2 + 60
+            self.expandButton.frame = buttonFrame
+            buttonFrame.origin.x = buttonsSpace * 3 + 60 * 2
+            self.leaveButton.frame = buttonFrame
+            let streamOrigin = self.streamView.frame.origin
+            let backgroundBounds = CGRect(x: 0, y: streamOrigin.y - 50,
+                                          width: self.contentNode.view.frame.width,
+                                          height: self.streamView.bounds.height + 150)
+            self.streamBackgroundView.updateFrame(backgroundBounds)
+        } else {
+            let height = layout.size.height
+            let width = layout.size.width
+            self.optionsButton.frame = CGRect(x: width / 4 + 20, y: 12,
+                                              width: 34, height: 34)
+            self.pictureInPictureButton.frame = CGRect(x: width - 54 - width / 4, y: 12,
+                                                       width: 34, height: 34)
+            self.titleView.frame = CGRect(x: 64 + width / 4, y: 12,
+                                          width: width - 128 - width / 2, height: 34)
+            
+            let streamViewSize: CGSize = CGSize(width: width - 32 - width / 2,
+                                                height: height / 2)
+            self.streamView.frame = CGRect(x: 16 + width / 4,
+                                            y: self.titleView.frame.maxY + 10,
+                                            width: streamViewSize.width,
+                                            height: streamViewSize.height)
+            self.watchersCounterNode.updateLayout(CGRect(x: width / 4,
+                                                    y: self.streamView.frame.maxY + 35,
+                                                    width: width / 2,
+                                                    height: 60))
+            self.watchingLabel.frame = CGRect(x: width / 4,
+                                              y: self.watchersCounterNode.frame.maxY + 2,
+                                              width: width / 2,
+                                              height: 18)
+            let buttonsSpace = (height - 3 * 80) / 4
+            var buttonFrame: CGRect = CGRect(x: width - self.rightHeight() - 70,
+                                             y: buttonsSpace,
+                                             width: 60, height: 80)
+            self.leaveButton.frame = buttonFrame
+            buttonFrame.origin.y = buttonsSpace * 2 + 80
+            self.expandButton.frame = buttonFrame
+            buttonFrame.origin.y = buttonsSpace * 3 + 80 * 2
+            self.shareButton.frame = buttonFrame
+            let streamOrigin = self.streamView.frame.origin
+            let backgroundBounds = CGRect(x: width / 4, y: streamOrigin.y - 50,
+                                          width: self.streamView.bounds.width + 32,
+                                          height: self.streamView.bounds.height + 150)
+            self.streamBackgroundView.updateFrame(backgroundBounds)
+        }
     }
     
     func calculateBackgroundHeight(_ width: CGFloat) -> CGFloat {
@@ -607,13 +506,33 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         height += 35
         height += 80
         height += 40
-        height += bottomHeight()
+        height += self.bottomHeight()
         return height
+    }
+    
+    private func topHeight() -> CGFloat {
+        guard let window = UIApplication.shared.windows.first else { return 0 }
+        return window.safeAreaInsets.top
+    }
+    
+    private func leftHeight() -> CGFloat {
+        guard let window = UIApplication.shared.windows.first else { return 0 }
+        return window.safeAreaInsets.left
+    }
+    
+    private func rightHeight() -> CGFloat {
+        guard let window = UIApplication.shared.windows.first else { return 0 }
+        return window.safeAreaInsets.right
     }
     
     private func bottomHeight() -> CGFloat {
         guard let window = UIApplication.shared.windows.first else { return 0 }
         return window.safeAreaInsets.bottom
+    }
+    
+    private func displayCornerRadius() -> CGFloat {
+        guard let window = UIApplication.shared.windows.first else { return 0 }
+        return window.value(forKey:"_displayCornerRadius") as? CGFloat ?? 0
     }
     
     func animateIn() {
@@ -628,14 +547,14 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         let size = layout.size
         let initialBounds = CGRect(origin: .zero,
                                    size: size)
-        self.contentContainer.bounds = initialBounds
+        self.viewNode.bounds = initialBounds
             .offsetBy(dx: 0, dy: -size.height)
-        self.contentContainer.isHidden = false
+        self.viewNode.isHidden = false
         
         let transition = ContainedViewLayoutTransition.animated(duration: 0.4,
                                                                 curve: .spring)
         transition.animateView({
-            self.contentContainer.view.bounds = initialBounds
+            self.viewNode.view.bounds = initialBounds
         }, completion: { _ in
             self.animatingAppearance = false
             
@@ -665,7 +584,7 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         let transition = ContainedViewLayoutTransition.animated(duration: 0.4,
                                                                 curve: .spring)
         transition.animateView({
-            self.contentContainer.view.bounds = initialBounds.offsetBy(dx: 0,
+            self.viewNode.view.bounds = initialBounds.offsetBy(dx: 0,
                                                                 dy: -size.height)
         }, completion: { _ in
             self.animatingAppearance = false
@@ -684,21 +603,32 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         guard !ignoreLayout else { return }
         let isFirstTime = self.validLayout == nil
         self.validLayout = (layout, navigationHeight)
-        let frame: CGRect = .init(origin: .zero,
-                                  size: layout.size)
-        self.dimNode.frame = frame
-        self.contentContainer.frame = frame
-        self.contentContainerBackgroundNode.frame = frame
-        let backgroundHeight = calculateBackgroundHeight(frame.width)
-        self.backgroundNode.frame = CGRect(x: 0,
-                                           y: frame.height - backgroundHeight,
-                                           width: frame.width,
-                                           height: backgroundHeight)
-        
         if isFirstTime {
             self.controller?.contentsReady.set(true)
         }
-        layoutViews()
+        self.layoutViews()
+    }
+    
+    func handleState() {
+        guard let (layout, _) = self.validLayout else { return }
+        UIView.animate(withDuration: 0.3, delay: 0.0, options: [.curveEaseOut]) {
+            if layout.orientation == .portrait {
+                switch self.state {
+                case .partial:
+                    self.contentBackgroundNode.backgroundColor = panelBackgroundColor
+                    self.contentBackgroundNode.layer.cornerRadius = 12
+                    self.dimNode.backgroundColor = .init(white: 0, alpha: 0.4)
+                case .fullscreen:
+                    self.contentBackgroundNode.backgroundColor = .black
+                    self.contentBackgroundNode.layer.cornerRadius = layout.deviceMetrics.screenCornerRadius - 0.5
+                    self.dimNode.backgroundColor = .init(white: 0, alpha: 1)
+                }
+            } else {
+                self.contentBackgroundNode.backgroundColor = .black
+                self.contentBackgroundNode.layer.cornerRadius = layout.deviceMetrics.screenCornerRadius - 0.5
+                self.dimNode.backgroundColor = .init(white: 0, alpha: 1)
+            }
+        }
     }
     
     @objc
@@ -711,27 +641,20 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
         let state = recognizer.state
         switch state {
         case .began:
-            self.initialContentViewYOrigin = self.contentContainer.frame.minY
+            self.initialContentViewYOrigin = self.contentNode.frame.minY
         case .changed:
             let translation = recognizer.translation(in: self.view)
-            let y = max(0, self.initialContentViewYOrigin + translation.y)
-            self.contentContainer.frame.origin.y = y
+            let y = max(self.initialContentViewYOrigin + translation.y,
+                        self.initialContentViewYOrigin)
+            self.contentBackgroundNode.frame.origin.y = y
         case .ended:
             let translation = recognizer.translation(in: self.view)
             let velocity = recognizer.velocity(in: self.view)
-            if translation.y >= 150 || velocity.y >= 300 {
-                controller?.dismiss(closing: false, manual: true)
+            if velocity.y >= 300 || translation.y > 150 {
+                self.controller?.dismiss(closing: false, manual: true)
             } else {
-                let bounds = CGRect(origin: .zero,
-                                    size: self.contentContainer.frame.size)
-                let transition = ContainedViewLayoutTransition.animated(duration: 0.4, curve: .spring)
-                transition.animateView({
-                    self.contentContainer.frame = bounds
-                }, completion: { _ in
-                    
-                    self.controller?.currentOverlayController?.dismiss()
-                    self.controller?.currentOverlayController = nil
-                })
+                self.handleState()
+                self.setContentPosition(animated: true)
             }
         default:
             break
@@ -753,16 +676,38 @@ public final class MediaStreamNode: ViewControllerTracingNode, UIGestureRecogniz
     }
     
     func handleExpandTapped() {
+        
     }
     
     func handleLeaveTapped() {
         self.hapticFeedback.impact(.light)
-        self.controller?.dismissAllTooltips()
         
         self.leaveDisposable.set((self.call.leave(terminateIfPossible: false)
         |> deliverOnMainQueue).start(completed: { [weak self] in
             self?.controller?.dismiss(closing: true)
         }))
+    }
+    
+    func setContentPosition(animated: Bool = false) {
+        guard let (layout, _) = self.validLayout else { return }
+        let size = layout.size
+        UIView.animate(withDuration: animated ? 0.4 : 0.0,
+                       delay: 0.0, options: .curveEaseOut) {
+            if layout.orientation == .portrait {
+                switch self.state {
+                case .fullscreen:
+                    self.contentBackgroundNode.frame.origin.y = 0
+                    self.contentNode.frame.origin.y = self.topHeight()
+                case .partial:
+                    let backgroundHeight = self.calculateBackgroundHeight(size.width)
+                    self.contentBackgroundNode.frame.origin.y = size.height - backgroundHeight
+                    self.contentNode.frame.origin.y = 0
+                }
+            } else {
+                self.contentBackgroundNode.frame.origin.y = 0
+                self.contentNode.frame.origin.y = 0
+            }
+        }
     }
     
     func presentShare() {
