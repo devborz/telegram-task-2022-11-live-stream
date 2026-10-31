@@ -606,7 +606,7 @@ class MetalVideoRenderingContext {
         }
         self.commandQueue = commandQueue
         
-        self.displayLink = ConstantDisplayLinkAnimator(setupVideoViews: { [weak self] in
+        self.displayLink = ConstantDisplayLinkAnimator(update: { [weak self] in
             self?.redraw()
         })
         self.displayLink?.isPaused = false
